@@ -1,121 +1,106 @@
 import streamlit as st
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from oauth2client.service_account import ServiceAccountCredentials
+from supabase import create_client, Client
 from datetime import datetime
-import gspread
+import pandas as pd
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Store Visual Repository", page_icon="📂")
+# --- 1. SETUP ---
+st.set_page_config(page_title="Visual Collector (Supabase)", page_icon="⚡")
 
-# 🔴 IMPORTANT: PASTE YOUR FOLDER ID INSIDE THE QUOTES BELOW 🔴
-# Example: TARGET_FOLDER_ID = "1HaBcD_eFgHiJkLmNoPqRsTuVwXyZ"
-TARGET_FOLDER_ID = "1u5pllOyCTfKQEJk6y_Q4PZNI4nr0xuWi" 
+# Initialize connection
+@st.cache_resource
+def init_connection():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    return create_client(url, key)
 
-SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets']
+supabase: Client = init_connection()
 
-# Marketing Elements List
-ELEMENT_TYPES = [
-    "Totem Pole",
-    "Flag Pole",
-    "Hoarding",
-    "Facade",
-    "Window Display",
-    "Cash Counter",
-    "Entrance Arch",
-    "Store Signage"
-]
+# Constants
+ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Window Display", "Cash Counter", "Store Signage"]
+STATUS_OPTIONS = ["Intact and Working", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
-# Status / Damage Options
-STATUS_OPTIONS = [
-    "Intact and Working",
-    "Flex Damage",
-    "Frame Damage",
-    "Total Damage",
-    "Letter Damage"
-]
-
-# --- 2. GOOGLE SERVICES SETUP ---
-def get_creds():
-    """Authenticates using the secrets file."""
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    return ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
+# --- 2. FUNCTIONS ---
 
 def get_store_list():
-    """Fetches store list from Google Sheets."""
+    """Fetches the list of stores from the 'stores' table."""
     try:
-        creds = get_creds()
-        client = gspread.authorize(creds)
-        # Ensure you have a tab named 'Stores' in your sheet
-        sheet = client.open("Visual_Audit_Database").worksheet("Stores")
-        return sheet.col_values(1)[1:] 
+        response = supabase.table("stores").select("store_code").execute()
+        # Extract just the codes into a list
+        return [row['store_code'] for row in response.data]
     except Exception as e:
-        return [f"Connection Error: {e}"]
+        return [f"Error fetching stores: {e}"]
 
-def upload_to_drive(file_obj, filename):
-    """Uploads the file directly to the Target Folder ID."""
-    creds = get_creds()
-    service = build('drive', 'v3', credentials=creds)
-    
-    file_metadata = {
-        'name': filename,
-        'parents': [TARGET_FOLDER_ID] # This forces it into YOUR drive
-    }
-    media = MediaIoBaseUpload(file_obj, mimetype='image/jpeg')
-    
-    file = service.files().create(
-        body=file_metadata, 
-        media_body=media, 
-        fields='id, webViewLink'
-    ).execute()
-    
-    return file.get('webViewLink')
-
-def log_to_sheet(timestamp, store, element, status, link):
-    """Logs the entry to the Google Sheet."""
+def upload_image(file_obj, filename):
+    """Uploads image to Supabase Storage and returns the public URL."""
     try:
-        creds = get_creds()
-        client = gspread.authorize(creds)
-        sheet = client.open("Visual_Audit_Database").sheet1
-        # Added 'status' to the log row
-        sheet.append_row([timestamp, store, element, status, "Uploaded", link])
+        bucket_name = "evidence-photos"
+        file_bytes = file_obj.getvalue()
+        
+        # Upload
+        supabase.storage.from_(bucket_name).upload(
+            path=filename,
+            file=file_bytes,
+            file_options={"content-type": "image/jpeg"}
+        )
+        
+        # Get Public URL
+        project_url = st.secrets["supabase"]["url"]
+        public_url = f"{project_url}/storage/v1/object/public/{bucket_name}/{filename}"
+        return public_url
+        
     except Exception as e:
-        st.error(f"Could not log to sheet: {e}")
+        st.error(f"Upload Error: {e}")
+        return None
 
-# --- 3. THE APP INTERFACE ---
-st.title("Store Visual Repository 📸")
-st.write("Upload latest visual evidence.")
+def save_log(store, element, status, image_url):
+    """Inserts a new row into the 'audit_logs' table."""
+    try:
+        data = {
+            "store_code": store,
+            "element_type": element,
+            "condition_status": status,
+            "image_url": image_url
+        }
+        supabase.table("audit_logs").insert(data).execute()
+        return True
+    except Exception as e:
+        st.error(f"Database Error: {e}")
+        return False
 
-# Inputs
-store_list = get_store_list()
-selected_store = st.selectbox("Select Store", store_list)
-selected_element = st.selectbox("Select Visual Element", ELEMENT_TYPES)
-selected_status = st.selectbox("Condition Status", STATUS_OPTIONS)
+# --- 3. APP INTERFACE ---
+st.title("Store Visual Collector ⚡")
+st.caption("Powered by Supabase")
 
-# Camera
+# Fetch Stores
+store_options = get_store_list()
+if not store_options:
+    st.error("Could not load store list. Check database connection.")
+
+# Form
+selected_store = st.selectbox("Select Store", store_options)
+selected_element = st.selectbox("Visual Element", ELEMENT_TYPES)
+selected_status = st.selectbox("Condition", STATUS_OPTIONS)
+
 photo = st.camera_input(f"Take photo of {selected_element}")
 
 if photo:
-    with st.spinner("Saving to Repository..."):
-        try:
-            # 1. Construct Filename
-            # Format: Store_Element_Status_Date.jpg
-            clean_element = selected_element.replace(" ", "")
-            clean_status = selected_status.replace(" ", "")
-            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with st.spinner("Syncing to Database..."):
+        # 1. Generate Filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        clean_element = selected_element.replace(" ", "")
+        filename = f"{selected_store}/{clean_element}_{timestamp}.jpg"
+        
+        # 2. Upload Image
+        image_url = upload_image(photo, filename)
+        
+        if image_url:
+            # 3. Save Record
+            success = save_log(selected_store, selected_element, selected_status, image_url)
             
-            filename = f"{selected_store}_{clean_element}_{clean_status}_{timestamp_str}.jpg"
-            
-            # 2. Upload
-            photo.seek(0)
-            link = upload_to_drive(photo, filename)
-            
-            # 3. Log
-            log_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_to_sheet(log_timestamp, selected_store, selected_element, selected_status, link)
-            
-            st.success(f"✅ Saved: {selected_element} ({selected_status})")
-            
-        except Exception as e:
-            st.error(f"Upload Error: {e}")
-            st.info("Check: Did you paste the correct Folder ID in line 13?")
+            if success:
+                st.success("✅ Saved Successfully!")
+                st.toast("Evidence Logged.")
+                
+                # Optional: Show preview of what was saved
+                st.write(f"**Log ID:** {filename}")
+                st.write(f"**Status:** {selected_status}")
