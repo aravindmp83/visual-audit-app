@@ -20,19 +20,10 @@ ELEMENT_TYPES = [
     "Flag Pole",
     "Hoarding",
     "Facade",
+    "Window Display",
+    "Cash Counter",
     "Entrance Arch",
-    "Store Signage",
-    "Others"
-]
-
-# Marketing Elements Status
-ELEMENT_TYPES = [
-    "Good Condition",
-    "Flex Damage",
-    "Frame Damage",
-    "Total Damage",
-    "Others",
-    "Others"
+    "Store Signage"
 ]
 
 # --- 2. GOOGLE SERVICES SETUP ---
