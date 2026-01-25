@@ -7,7 +7,7 @@ import requests
 import time
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="AI Visual Auditor", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Enterprise Visual Audit", page_icon="🔐", layout="wide")
 
 @st.cache_resource
 def init_connection():
@@ -21,243 +21,268 @@ supabase: Client = init_connection()
 ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Window Display"]
 STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage"]
 
-# --- 2. THE LEARNING AI ENGINE ---
+# --- 2. AUTHENTICATION MODULE ---
+def login():
+    st.markdown("## 🔐 Secure Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    
+    if st.button("Login"):
+        # Fetch user
+        user = supabase.table("users").select("*").eq("username", username).eq("password", password).execute().data
+        
+        if user:
+            u = user[0]
+            if not u['is_approved']:
+                st.error("Account pending approval by HQ.")
+            else:
+                st.session_state['user'] = u
+                st.success(f"Welcome {u['role']}")
+                st.rerun()
+        else:
+            st.error("Invalid credentials")
 
+    st.divider()
+    with st.expander("Register New Regional Admin"):
+        new_user = st.text_input("New Username")
+        new_pass = st.text_input("New Password", type="password")
+        new_region = st.text_input("Region (e.g., South, North)")
+        if st.button("Request Access"):
+            try:
+                supabase.table("users").insert({
+                    "username": new_user, "password": new_pass, 
+                    "role": "Regional_Admin", "region": new_region, "is_approved": False
+                }).execute()
+                st.success("Request sent to HQ for approval.")
+            except:
+                st.error("Username already taken.")
+
+def logout():
+    st.session_state['user'] = None
+    st.rerun()
+
+# --- 3. AI ENGINE (unchanged) ---
 @st.cache_resource
 def load_reference_memory():
-    """
-    Downloads ALL reference images from Supabase 'references' bucket 
-    and converts them to mathematical descriptors (ORB).
-    This runs ONCE and stays in memory = Super Fast.
-    """
+    # Only load ACTIVE campaigns
+    active_camps = supabase.table("campaigns").select("name").eq("is_active", True).execute().data
+    active_names = [c['name'] for c in active_camps]
+    
     memory = []
     orb = cv2.ORB_create(nfeatures=1000)
-    
     try:
-        # List all files in 'references' bucket
         files = supabase.storage.from_("references").list()
-        
         for f in files:
-            if f['name'].endswith(('.jpg', '.jpeg', '.png')):
-                # Download
-                url = supabase.storage.from_("references").get_public_url(f['name'])
-                resp = requests.get(url)
-                arr = np.frombuffer(resp.content, np.uint8)
-                img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-                
-                if img is not None:
-                    kp, des = orb.detectAndCompute(img, None)
-                    if des is not None:
-                        # Extract Campaign Name from filename (e.g., "WinterSale_01.jpg" -> "WinterSale")
-                        camp_name = f['name'].split('_')[0] 
-                        memory.append({
-                            "campaign": camp_name,
-                            "filename": f['name'],
-                            "descriptors": des
-                        })
+            if f['name'].endswith(('.jpg', '.png')):
+                camp_name = f['name'].split('_')[0]
+                # Only load if campaign is active
+                if camp_name in active_names:
+                    url = supabase.storage.from_("references").get_public_url(f['name'])
+                    resp = requests.get(url)
+                    arr = np.frombuffer(resp.content, np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+                    if img is not None:
+                        kp, des = orb.detectAndCompute(img, None)
+                        if des is not None:
+                            memory.append({"campaign": camp_name, "descriptors": des})
         return memory
-    except Exception as e:
-        st.error(f"Memory Load Error: {e}")
+    except:
         return []
 
 def run_smart_audit(evidence_url, memory):
-    """Compares evidence against the entire Memory."""
-    if not memory:
-        return 0, "Fail", "Unknown", "No References Found"
-
+    if not memory: return 0, "Fail", "Unknown", "No Active References"
     try:
-        # Download Evidence
         resp = requests.get(evidence_url)
         img_ev = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_GRAYSCALE)
-        
         orb = cv2.ORB_create(nfeatures=1000)
         kp_ev, des_ev = orb.detectAndCompute(img_ev, None)
+        if des_ev is None: return 0, "Fail", "Unknown", "Blurry"
         
-        if des_ev is None:
-            return 0, "Fail", "Unknown", "Image too blurry / No features"
-
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        
         best_score = 0
         best_campaign = "Unknown"
-        best_ref_file = ""
-
-        # Check against ALL references in memory
+        
         for ref in memory:
             matches = bf.match(des_ev, ref['descriptors'])
             matches = sorted(matches, key=lambda x: x.distance)
-            
-            # Score = Number of good matches (distance < 50)
-            good_matches = [m for m in matches if m.distance < 60]
-            score = len(good_matches)
-            
+            score = len([m for m in matches if m.distance < 60])
             if score > best_score:
                 best_score = score
                 best_campaign = ref['campaign']
-                best_ref_file = ref['filename']
-
-        # LOGIC: Define Thresholds
-        # Adjust '20' based on real-world testing
-        if best_score > 20:
-            return best_score, "Pass", best_campaign, f"Matched {best_ref_file}"
-        else:
-            return best_score, "Fail", "Unknown", f"Low Match Score (Best: {best_score} matches)"
-
-    except Exception as e:
-        return 0, "Error", "Error", str(e)
-
-# --- 3. STORE MANAGER VIEW ---
-def store_manager_view():
-    st.title("📱 Store Visual Upload")
-    
-    # Simple Store Selector
-    stores = supabase.table("stores").select("store_code").execute().data
-    store_codes = [s['store_code'] for s in stores]
-    
-    sel_store = st.selectbox("Select Store", store_codes)
-    element = st.selectbox("Visual Element", ELEMENT_TYPES)
-    condition = st.selectbox("Condition", STATUS_OPTIONS)
-    photo = st.camera_input("Take Photo")
-
-    if photo:
-        with st.spinner("Uploading..."):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{sel_store}/{element.replace(' ','')}_{timestamp}.jpg"
-            file_bytes = photo.getvalue()
-            
-            supabase.storage.from_("evidence-photos").upload(
-                path=filename, file=file_bytes, file_options={"content-type": "image/jpeg"}
-            )
-            
-            public_url = f"{st.secrets['supabase']['url']}/storage/v1/object/public/evidence-photos/{filename}"
-            
-            # Save Initial Log
-            data = {
-                "store_code": sel_store,
-                "element_type": element,
-                "condition_status": condition,
-                "image_url": public_url,
-                "ai_status": "Pending",
-                "campaign_name": "Pending Scan"
-            }
-            supabase.table("audit_logs").insert(data).execute()
-            st.success("✅ Uploaded! HQ will audit shortly.")
-
-# --- 4. HEAD OFFICE ADMIN (THE BRAIN) ---
-def head_office_view():
-    st.title("🧠 AI Command Center")
-    
-    # Load Memory
-    memory = load_reference_memory()
-    st.caption(f"AI Knowledge: {len(memory)} reference images loaded.")
-
-    tab1, tab2 = st.tabs(["🔍 Audit Dashboard", "🎓 Train AI (References)"])
-
-    # TAB 1: AUDIT & REVIEW
-    with tab1:
-        # Filter for Pending
-        filter_status = st.radio("Show:", ["Pending", "Fail", "Pass"], horizontal=True)
-        logs = supabase.table("audit_logs").select("*").eq("ai_status", filter_status).order("created_at", desc=True).execute().data
         
-        if not logs:
-            st.info("No records found.")
+        if best_score > 20: return best_score, "Pass", best_campaign, "Matched"
+        else: return best_score, "Fail", "Unknown", "Low Score"
+    except: return 0, "Error", "Error", "System Error"
+
+# --- 4. VIEWS ---
+
+def store_app_view():
+    st.header("📱 Store Visual Update")
+    
+    # 1. Fetch Stores
+    all_stores = supabase.table("stores").select("*").execute().data
+    
+    # 2. Cluster Filter
+    clusters = sorted(list(set([s['cluster_manager'] for s in all_stores if s['cluster_manager']])))
+    sel_cluster = st.selectbox("Select Cluster Manager", clusters)
+    
+    # 3. Store Code Filter (Nested)
+    filtered_stores = [s for s in all_stores if s['cluster_manager'] == sel_cluster]
+    store_options = [f"{s['store_code']} - {s.get('store_name', '')}" for s in filtered_stores]
+    sel_store_display = st.selectbox("Select Store", store_options)
+    
+    if sel_store_display:
+        sel_store_code = sel_store_display.split(" - ")[0]
         
-        for log in logs:
+        # 4. Upload
+        element = st.selectbox("Visual Element", ELEMENT_TYPES)
+        condition = st.selectbox("Condition", STATUS_OPTIONS)
+        photo = st.camera_input("Take Photo")
+        
+        if photo:
+            with st.spinner("Uploading..."):
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{sel_store_code}/{element.replace(' ','')}_{timestamp}.jpg"
+                file_bytes = photo.getvalue()
+                
+                supabase.storage.from_("evidence-photos").upload(path=filename, file=file_bytes, file_options={"content-type": "image/jpeg"})
+                public_url = f"{st.secrets['supabase']['url']}/storage/v1/object/public/evidence-photos/{filename}"
+                
+                data = {
+                    "store_code": sel_store_code, "element_type": element, 
+                    "condition_status": condition, "image_url": public_url, 
+                    "ai_status": "Pending", "campaign_name": "Pending Scan"
+                }
+                supabase.table("audit_logs").insert(data).execute()
+                st.success("Uploaded!")
+
+def admin_dashboard(user):
+    st.title(f"Admin Panel ({user['region'] if user['region'] else 'HQ'})")
+    
+    # Security: Password Reset & User Approval (HQ Only)
+    if user['role'] == 'HQ':
+        with st.expander("🛠 User Management"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.subheader("Pending Approvals")
+                pending = supabase.table("users").select("*").eq("is_approved", False).execute().data
+                for p in pending:
+                    if st.button(f"Approve {p['username']}", key=p['username']):
+                        supabase.table("users").update({"is_approved": True}).eq("username", p['username']).execute()
+                        st.rerun()
+            with c2:
+                st.subheader("Reset Password")
+                target_user = st.text_input("Target Username")
+                new_pw = st.text_input("New Password", type="password", key="new_pw")
+                if st.button("Reset"):
+                    supabase.table("users").update({"password": new_pw}).eq("username", target_user).execute()
+                    st.success("Password Updated")
+
+    # --- AUDIT VIEW ---
+    st.subheader("Audit Dashboard")
+    
+    view_mode = st.radio("View Mode", ["Status View", "Store View"], horizontal=True)
+    
+    # FILTER LOGIC (Region Security)
+    query = supabase.table("audit_logs").select("*").order("created_at", desc=True)
+    
+    # If Regional Admin, filter only their stores
+    if user['role'] == 'Regional_Admin':
+        region_stores = supabase.table("stores").select("store_code").eq("region", user['region']).execute().data
+        valid_codes = [s['store_code'] for s in region_stores]
+        query = query.in_("store_code", valid_codes)
+    
+    logs = query.execute().data
+    
+    if view_mode == "Status View":
+        status_filter = st.selectbox("Filter Status", ["Pending", "Pass", "Fail"])
+        filtered_logs = [l for l in logs if l['ai_status'] == status_filter]
+        
+        for log in filtered_logs:
             with st.container(border=True):
-                c1, c2, c3 = st.columns([1, 2, 2])
-                with c1:
-                    st.image(log['image_url'], width=150)
-                
-                with c2:
-                    st.write(f"**{log['store_code']}**")
-                    st.caption(f"Element: {log['element_type']}")
-                    st.caption(f"Reason: {log.get('failure_reason', 'N/A')}")
-                
+                c1, c2, c3 = st.columns([1, 2, 1])
+                with c1: st.image(log['image_url'], width=100)
+                with c2: 
+                    st.write(f"**{log['store_code']}** - {log['element_type']}")
+                    st.caption(f"Campaign: {log.get('campaign_name', 'Unknown')}")
                 with c3:
-                    # ACTION BUTTONS
                     if log['ai_status'] == "Pending":
-                        if st.button("⚡ Run AI Scan", key=f"run_{log['id']}"):
-                            score, status, camp, reason = run_smart_audit(log['image_url'], memory)
-                            # Update DB
-                            supabase.table("audit_logs").update({
-                                "ai_score": score,
-                                "ai_status": status,
-                                "campaign_name": camp,
-                                "failure_reason": reason
-                            }).eq("id", log['id']).execute()
+                        if st.button("Run AI", key=log['id']):
+                            memory = load_reference_memory()
+                            sc, stt, cp, _ = run_smart_audit(log['image_url'], memory)
+                            supabase.table("audit_logs").update({"ai_score": sc, "ai_status": stt, "campaign_name": cp}).eq("id", log['id']).execute()
                             st.rerun()
-                    
-                    elif log['ai_status'] == "Fail":
-                        st.error(f"Failed. Reason: {log.get('failure_reason')}")
-                        st.write("Does this belong to a campaign?")
-                        
-                        # THE LEARNING DROPDOWN
-                        campaigns = supabase.table("campaigns").select("name").execute().data
-                        camp_list = [c['name'] for c in campaigns]
-                        new_camp = st.selectbox("Assign Campaign:", camp_list, key=f"sel_{log['id']}")
-                        
-                        if st.button("🎓 Teach AI (Add to References)", key=f"teach_{log['id']}"):
-                            # 1. Download the Evidence Image
-                            resp = requests.get(log['image_url'])
-                            img_bytes = resp.content
-                            
-                            # 2. Upload to REFERENCES bucket with Campaign Name
-                            # Format: CampaignName_RandomID.jpg
-                            new_ref_name = f"{new_camp}_{int(time.time())}.jpg"
-                            supabase.storage.from_("references").upload(
-                                path=new_ref_name, 
-                                file=img_bytes, 
-                                file_options={"content-type": "image/jpeg"}
-                            )
-                            
-                            # 3. Update the Log
-                            supabase.table("audit_logs").update({
-                                "ai_status": "Pass",
-                                "campaign_name": new_camp,
-                                "failure_reason": "Manually Verified & Learned"
-                            }).eq("id", log['id']).execute()
-                            
-                            # 4. Clear Cache to reload memory next time
-                            st.cache_resource.clear()
-                            st.success(f"AI Learned! '{new_ref_name}' added to references.")
-                            time.sleep(1)
-                            st.rerun()
+                    else:
+                        st.write(f"**{log['ai_status']}**")
 
-    # TAB 2: CAMPAIGN MANAGER
-    with tab2:
-        st.subheader("Add Official Campaign Visuals")
-        new_camp_name = st.text_input("Campaign Name (e.g., SummerSale)")
-        ref_file = st.file_uploader("Upload Official JPEGs", accept_multiple_files=True)
+    elif view_mode == "Store View":
+        # Cluster -> Store Dropdown
+        all_stores = supabase.table("stores").select("*").execute().data
+        # Filter stores if regional
+        if user['role'] == 'Regional_Admin':
+            all_stores = [s for s in all_stores if s['region'] == user['region']]
+            
+        clusters = sorted(list(set([s['cluster_manager'] for s in all_stores if s['cluster_manager']])))
+        sel_clust = st.selectbox("Cluster", ["All"] + clusters)
         
-        if st.button("Upload Reference"):
-            if new_camp_name and ref_file:
-                for f in ref_file:
-                    file_name = f"{new_camp_name}_{f.name}"
-                    file_bytes = f.getvalue()
-                    supabase.storage.from_("references").upload(
-                        path=file_name, file=file_bytes, file_options={"content-type": "image/jpeg"}
-                    )
-                # Save Campaign Name to DB if unique
-                try:
-                    supabase.table("campaigns").insert({"name": new_camp_name}).execute()
-                except:
-                    pass # Ignore duplicate names
-                
-                st.cache_resource.clear()
-                st.success("References Updated!")
+        if sel_clust != "All":
+            valid_stores = [s['store_code'] for s in all_stores if s['cluster_manager'] == sel_clust]
+            logs = [l for l in logs if l['store_code'] in valid_stores]
+            
+            sel_store = st.selectbox("Store Code", ["All"] + valid_stores)
+            if sel_store != "All":
+                logs = [l for l in logs if l['store_code'] == sel_store]
+        
+        st.write(f"Showing {len(logs)} images")
+        # Grid View
+        cols = st.columns(4)
+        for idx, log in enumerate(logs):
+            with cols[idx % 4]:
+                st.image(log['image_url'], use_column_width=True)
+                st.caption(f"{log['element_type']} ({log['ai_status']})")
+
+    # --- CAMPAIGN MANAGER ---
+    if user['role'] == 'HQ':
+        st.divider()
+        st.subheader("Campaign Management")
+        
+        # List Campaigns
+        camps = supabase.table("campaigns").select("*").execute().data
+        for c in camps:
+            c1, c2 = st.columns([3, 1])
+            with c1: st.write(f"**{c['name']}**")
+            with c2: 
+                is_active = st.checkbox("Active", value=c['is_active'], key=f"camp_{c['id']}")
+                if is_active != c['is_active']:
+                    supabase.table("campaigns").update({"is_active": is_active}).eq("id", c['id']).execute()
+                    st.toast("Updated")
+                    time.sleep(1)
+                    st.rerun()
 
 # --- 5. MAIN ---
 def main():
-    if "admin" not in st.session_state:
-        st.session_state.admin = False
+    # Session State for User
+    if 'user' not in st.session_state:
+        st.session_state['user'] = None
 
-    st.sidebar.image("https://img.icons8.com/color/96/shop.png", width=50)
-    mode = st.sidebar.radio("Mode", ["Store App", "HQ Admin"])
-    
-    if mode == "Store App":
-        store_manager_view()
+    if st.session_state['user'] is None:
+        login()
     else:
-        head_office_view()
+        # Sidebar
+        user = st.session_state['user']
+        st.sidebar.write(f"Logged in as: **{user['username']}** ({user['role']})")
+        if st.sidebar.button("Logout"):
+            logout()
+            
+        if user['role'] == 'Store_User': # If you create store users
+            store_app_view()
+        elif user['role'] in ['HQ', 'Regional_Admin']:
+            # Admin can toggle between upload view and dashboard
+            mode = st.sidebar.radio("Mode", ["Dashboard", "Upload Tool"])
+            if mode == "Dashboard":
+                admin_dashboard(user)
+            else:
+                store_app_view()
 
 if __name__ == "__main__":
     main()
