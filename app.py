@@ -1,67 +1,91 @@
 import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image
-import os
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from datetime import datetime
 
-# --- 1. SETUP & CONFIGURATION ---
-st.set_page_config(page_title="Visual Adherence Audit", page_icon="✅")
+# --- CONFIGURATION ---
+# Define the visuals you want to check
+VISUAL_SLOTS = ["Main Window", "Cash Counter"]
+STORES = [f"Store_{i}" for i in range(1, 201)]
 
-# Mock Database of Visuals (In real life, this comes from your Google Sheet)
-VISUAL_LIST = ["Window_Display_Left", "Cash_Counter_Standee", "Entrance_Totem"]
-STORES = [f"Store_{i:03d}" for i in range(1, 201)]
+# --- SETUP GOOGLE SHEETS CONNECTION ---
+def get_google_sheet():
+    scope = ['https://www.googleapis.com/auth/spreadsheets', 
+             'https://www.googleapis.com/auth/drive']
+    # Load secrets from Streamlit Cloud
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    client = gspread.authorize(creds)
+    return client.open("Visual_Audit_Database").sheet1
 
-def load_reference_images():
-    """Loads the Master JPEGs into memory for comparison."""
-    # In a real deployment, these load from a folder. 
-    # For now, we simulate with a placeholder logic.
-    return {"Window_Display_Left": "master_window_v2.jpg"}
-
-# --- 2. THE AI BRAIN (ORB Matcher) ---
-def check_visual_compliance(uploaded_image_file, reference_name):
-    """
-    Compares the uploaded photo against the Master JPEG.
-    Returns: Score (0-100), Status (Current/Old/Mismatch)
-    """
+# --- IMAGE MATCHING LOGIC ---
+def analyze_image(uploaded_image, reference_path):
     # Convert uploaded file to OpenCV format
-    file_bytes = np.asarray(bytearray(uploaded_image_file.read()), dtype=np.uint8)
+    file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
     img_input = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
     
-    # Initialize ORB detector
-    orb = cv2.ORB_create()
-    kp_input, desc_input = orb.detectAndCompute(img_input, None)
+    # Load Reference Image
+    img_ref = cv2.imread(reference_path, cv2.IMREAD_GRAYSCALE)
     
-    # NOTE: In the live version, we would compare 'desc_input' against 
-    # the pre-loaded descriptor of the 'reference_name'.
-    # For this simplified pilot UI demo, we simulate a check.
-    
-    if len(kp_input) > 50: # If image has enough detail
-        return 95, "✅ Current Campaign"
-    else:
-        return 20, "❌ Unclear / Old Visual"
-
-# --- 3. THE APP INTERFACE ---
-st.title("Store Visual Audit 📸")
-
-# A. User Inputs
-selected_store = st.selectbox("Select Your Store", STORES)
-selected_visual = st.selectbox("Which Visual are you checking?", VISUAL_LIST)
-
-# B. Camera Input
-uploaded_file = st.camera_input(f"Take a photo of {selected_visual}")
-
-if uploaded_file:
-    # C. Instant Processing
-    with st.spinner('Analyzing Visual...'):
-        score, status = check_visual_compliance(uploaded_file, selected_visual)
+    if img_ref is None:
+        return 0 # Error loading reference
         
-        # D. Feedback
-        if score > 80:
-            st.success(f"{status} (Match: {score}%)")
-            st.balloons()
-            # Here we would code: save_to_google_sheets(selected_store, score)
+    # ORB Detector
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(img_input, None)
+    kp2, des2 = orb.detectAndCompute(img_ref, None)
+    
+    # Match Features
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    matches = sorted(matches, key=lambda x: x.distance)
+    
+    # Calculate Score (Top 15% of matches)
+    good_matches = [m for m in matches if m.distance < 50]
+    score = len(good_matches)
+    return score
+
+# --- THE APP INTERFACE ---
+st.title("Visual Compliance Audit 📸")
+
+store_id = st.selectbox("Select Store", STORES)
+visual_type = st.selectbox("Select Visual", VISUAL_SLOTS)
+photo = st.camera_input("Take a photo of the visual")
+
+if photo:
+    with st.spinner("Analyzing Compliance..."):
+        # 1. Check against CURRENT Campaign
+        # Note: Ensure 'references/current_window.jpg' exists in your repo
+        score_current = analyze_image(photo, "references/current_window.jpg")
+        
+        # 2. Check against OLD Campaign
+        photo.seek(0) # Reset file pointer
+        score_old = analyze_image(photo, "references/old_window.jpg")
+        
+        final_status = "Unknown"
+        points = 0
+        
+        # Threshold Logic (Adjust '20' based on testing)
+        if score_current > 20:
+            final_status = "✅ Compliant (Current)"
+            points = 1
+            st.success(f"Verified! Found Current Campaign. (Score: {score_current})")
+        elif score_old > 20:
+            final_status = "⚠️ Non-Compliant (Old Visual Found)"
+            points = 0
+            st.error(f"Alert! Old Campaign Detected. (Score: {score_old})")
         else:
-            st.error(f"{status} (Match: {score}%)")
-            st.warning("Please check if the visual is damaged or the old version.")
-            
-    st.info("Photo logged for Regional Review.")
+            final_status = "❌ Missing / Unclear"
+            points = 0
+            st.warning("Could not identify visual. Please retake closer.")
+
+        # 3. Save to Google Sheet
+        try:
+            sheet = get_google_sheet()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sheet.append_row([timestamp, store_id, visual_type, final_status, points])
+            st.toast("Audit Saved to Database!")
+        except Exception as e:
+            st.error(f"Database Error: {e}")
