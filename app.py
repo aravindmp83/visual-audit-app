@@ -1,91 +1,152 @@
 import streamlit as st
 import cv2
 import numpy as np
+import os
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 
-# --- CONFIGURATION ---
-# Define the visuals you want to check
-VISUAL_SLOTS = ["Main Window", "Cash Counter"]
-STORES = [f"Store_{i}" for i in range(1, 201)]
+# --- 1. SETUP & AUTH ---
+st.set_page_config(page_title="Smart Visual Audit", page_icon="🕵️")
 
-# --- SETUP GOOGLE SHEETS CONNECTION ---
+# Google Sheets Auth
 def get_google_sheet():
     scope = ['https://www.googleapis.com/auth/spreadsheets', 
              'https://www.googleapis.com/auth/drive']
-    # Load secrets from Streamlit Cloud
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
+    # Ensure your Google Sheet is named exactly this:
     return client.open("Visual_Audit_Database").sheet1
 
-# --- IMAGE MATCHING LOGIC ---
-def analyze_image(uploaded_image, reference_path):
-    # Convert uploaded file to OpenCV format
+# --- 2. THE AI ENGINE (Multi-Folder Support) ---
+
+@st.cache_resource
+def load_reference_signatures():
+    """
+    Scans the 'references' folder and memorizes the features of every campaign image.
+    Returns a dictionary of signatures.
+    """
+    signatures = {"current": [], "old": []}
+    orb = cv2.ORB_create()
+    
+    # We look for a folder named 'references' in the same directory as this script
+    base_dir = "references" 
+    
+    if not os.path.exists(base_dir):
+        st.error(f"⚠️ Error: Could not find '{base_dir}' folder in GitHub repo.")
+        return signatures
+
+    # Walk through folders
+    for category in ["current", "old"]:
+        cat_path = os.path.join(base_dir, category)
+        if os.path.exists(cat_path):
+            for root, dirs, files in os.walk(cat_path):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        # Get Campaign Name from the sub-folder name
+                        campaign_name = os.path.basename(root) 
+                        full_path = os.path.join(root, file)
+                        
+                        # Read and process image
+                        img = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+                        if img is not None:
+                            kp, des = orb.detectAndCompute(img, None)
+                            if des is not None:
+                                signatures[category].append({
+                                    "campaign": campaign_name,
+                                    "filename": file,
+                                    "descriptors": des
+                                })
+    
+    return signatures
+
+def find_best_match(uploaded_image, signatures):
+    """
+    Compares upload against ALL loaded signatures.
+    """
+    # Convert upload to OpenCV format
     file_bytes = np.asarray(bytearray(uploaded_image.read()), dtype=np.uint8)
     img_input = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
     
-    # Load Reference Image
-    img_ref = cv2.imread(reference_path, cv2.IMREAD_GRAYSCALE)
-    
-    if img_ref is None:
-        return 0 # Error loading reference
-        
-    # ORB Detector
     orb = cv2.ORB_create()
-    kp1, des1 = orb.detectAndCompute(img_input, None)
-    kp2, des2 = orb.detectAndCompute(img_ref, None)
+    kp_input, des_input = orb.detectAndCompute(img_input, None)
     
-    # Match Features
+    if des_input is None:
+        return None, "Image too blurry", 0
+
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    matches = sorted(matches, key=lambda x: x.distance)
     
-    # Calculate Score (Top 15% of matches)
-    good_matches = [m for m in matches if m.distance < 50]
-    score = len(good_matches)
-    return score
+    best_match_score = 0
+    best_campaign = "Unknown"
+    detected_category = "None"
 
-# --- THE APP INTERFACE ---
-st.title("Visual Compliance Audit 📸")
+    # Check against CURRENT first
+    for item in signatures["current"]:
+        matches = bf.match(des_input, item["descriptors"])
+        # Score = number of similar features found
+        score = len(matches) 
+        if score > best_match_score:
+            best_match_score = score
+            best_campaign = item["campaign"]
+            detected_category = "current"
 
-store_id = st.selectbox("Select Store", STORES)
-visual_type = st.selectbox("Select Visual", VISUAL_SLOTS)
-photo = st.camera_input("Take a photo of the visual")
+    # If no strong match in current, check OLD
+    # Threshold: 30 matches is a decent baseline for "Simlarity"
+    if best_match_score < 30: 
+        for item in signatures["old"]:
+            matches = bf.match(des_input, item["descriptors"])
+            score = len(matches)
+            if score > best_match_score:
+                best_match_score = score
+                best_campaign = item["campaign"]
+                detected_category = "old"
+
+    return detected_category, best_campaign, best_match_score
+
+# --- 3. THE USER INTERFACE ---
+
+st.title("Visual Campaign Tracker 📸")
+
+# Load the AI Brain (Happens once)
+refs = load_reference_signatures()
+st.write(f"System Loaded: {len(refs['current'])} Current & {len(refs['old'])} Old Visuals.")
+
+store_id = st.selectbox("Select Store", [f"Store_{i}" for i in range(1, 201)])
+photo = st.camera_input("Capture Store Visual")
 
 if photo:
-    with st.spinner("Analyzing Compliance..."):
-        # 1. Check against CURRENT Campaign
-        # Note: Ensure 'references/current_window.jpg' exists in your repo
-        score_current = analyze_image(photo, "references/current_window.jpg")
+    with st.spinner("AI is scanning all campaigns..."):
+        category, campaign, score = find_best_match(photo, refs)
         
-        # 2. Check against OLD Campaign
-        photo.seek(0) # Reset file pointer
-        score_old = analyze_image(photo, "references/old_window.jpg")
-        
-        final_status = "Unknown"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        status_msg = ""
         points = 0
         
-        # Threshold Logic (Adjust '20' based on testing)
-        if score_current > 20:
-            final_status = "✅ Compliant (Current)"
+        # LOGIC FOR SCORING
+        if score < 30: # No match found
+            st.warning("⚠️ No matching campaign found. Is the photo clear?")
+            status_msg = "Unknown / No Match"
+            points = 0
+            
+        elif category == "current":
+            st.success(f"✅ Verified! Campaign: **{campaign}**")
+            st.caption(f"Confidence Score: {score}")
+            status_msg = f"Compliant: {campaign}"
             points = 1
-            st.success(f"Verified! Found Current Campaign. (Score: {score_current})")
-        elif score_old > 20:
-            final_status = "⚠️ Non-Compliant (Old Visual Found)"
+            st.balloons()
+            
+        elif category == "old":
+            st.error(f"❌ Alert! Old Campaign Detected: **{campaign}**")
+            st.caption("Please remove this visual immediately.")
+            status_msg = f"Non-Compliant: {campaign} (Old)"
             points = 0
-            st.error(f"Alert! Old Campaign Detected. (Score: {score_old})")
-        else:
-            final_status = "❌ Missing / Unclear"
-            points = 0
-            st.warning("Could not identify visual. Please retake closer.")
 
-        # 3. Save to Google Sheet
-        try:
-            sheet = get_google_sheet()
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            sheet.append_row([timestamp, store_id, visual_type, final_status, points])
-            st.toast("Audit Saved to Database!")
-        except Exception as e:
-            st.error(f"Database Error: {e}")
+        # SAVE TO SHEET
+        if score >= 30: # Only save if we actually found something
+            try:
+                sheet = get_google_sheet()
+                sheet.append_row([timestamp, store_id, campaign, status_msg, points])
+                st.toast(f"Data saved for {store_id}")
+            except Exception as e:
+                st.error(f"Database Error: {e}")
