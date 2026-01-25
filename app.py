@@ -10,7 +10,7 @@ st.set_page_config(page_title="Store Visual Repository", page_icon="📂")
 
 # 🔴 IMPORTANT: PASTE YOUR FOLDER ID INSIDE THE QUOTES BELOW 🔴
 # Example: TARGET_FOLDER_ID = "1HaBcD_eFgHiJkLmNoPqRsTuVwXyZ"
-TARGET_FOLDER_ID = "PASTE_YOUR_FOLDER_ID_HERE" 
+TARGET_FOLDER_ID = "1u5pllOyCTfKQEJk6y_Q4PZNI4nr0xuWi" 
 
 SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/spreadsheets']
 
