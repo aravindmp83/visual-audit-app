@@ -166,7 +166,7 @@ def store_upload_view():
             st.caption("Session Uploads:")
             for item in st.session_state.upload_history:
                 st.write(f"✅ {item}")
-            if st.button("End Session"): # [cite: 9]
+            if st.button("Submit"): # [cite: 9]
                 st.session_state.upload_history = []
                 st.rerun()
 
