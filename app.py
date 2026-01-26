@@ -19,8 +19,8 @@ def init_connection():
 supabase: Client = init_connection()
 
 # Dropdown Constants
-ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Window Display", "Cash Counter"]
-STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
+ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Others", "Lollypop"]
+STATUS_OPTIONS = ["Good", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
 # --- 2. AI ENGINE ---
 @st.cache_resource
