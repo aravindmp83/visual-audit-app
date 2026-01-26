@@ -19,8 +19,8 @@ def init_connection():
 supabase: Client = init_connection()
 
 # Dropdown Constants
-ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Others", "Lollypop"]
-STATUS_OPTIONS = ["Good", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
+ELEMENT_TYPES = ["Totem Pole", "Flag Pole", "Hoarding", "Facade", "Window Display", "Cash Counter"]
+STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
 # --- 2. AI ENGINE ---
 @st.cache_resource
@@ -89,105 +89,58 @@ def store_upload_view():
     st.markdown("### 🏪 Store Visual Upload Portal")
     st.info("No login required. Select your store details below.")
 
-    # --- 1. SESSION STATE INITIALIZATION ---
-    # This keeps track of the 'refresh' for the camera and the history of uploads
-    if 'uploader_key' not in st.session_state:
-        st.session_state.uploader_key = 0
-    if 'upload_history' not in st.session_state:
-        st.session_state.upload_history = []
-
     # Fetch Store Data
     all_stores = supabase.table("stores").select("*").execute().data
     if not all_stores:
         st.error("No store data found. Please contact Admin.")
         return
 
-    # --- 2. STORE SELECTION (Persists across uploads) ---
-    # We use columns to make it compact
-    c1, c2 = st.columns(2)
-    
-    with c1:
-        regions = sorted(list(set([s['region'] for s in all_stores if s['region']])))
-        sel_region = st.selectbox("Region", regions)
-        
-        cluster_stores = [s for s in all_stores if s['region'] == sel_region]
-        clusters = sorted(list(set([s['cluster_manager'] for s in cluster_stores if s['cluster_manager']])))
-        sel_cluster = st.selectbox("Cluster Manager", clusters)
+    # 1. Region Filter
+    regions = sorted(list(set([s['region'] for s in all_stores if s['region']])))
+    sel_region = st.selectbox("Select Region", regions)
 
-    with c2:
-        final_stores = [s for s in cluster_stores if s['cluster_manager'] == sel_cluster]
-        store_map = {f"{s['store_code']} - {s.get('store_name', '')}": s for s in final_stores}
-        sel_store_display = st.selectbox("Select Store", list(store_map.keys()))
+    # 2. Cluster Filter
+    cluster_stores = [s for s in all_stores if s['region'] == sel_region]
+    clusters = sorted(list(set([s['cluster_manager'] for s in cluster_stores if s['cluster_manager']])))
+    sel_cluster = st.selectbox("Select Cluster Manager", clusters)
+
+    # 3. Store Filter
+    final_stores = [s for s in cluster_stores if s['cluster_manager'] == sel_cluster]
+    store_map = {f"{s['store_code']} - {s.get('store_name', '')}": s for s in final_stores}
+    sel_store_display = st.selectbox("Select Store", list(store_map.keys()))
 
     if sel_store_display:
         store_data = store_map[sel_store_display]
         st.divider()
-        st.markdown(f"#### 📸 Uploading for: :blue[{store_data['store_code']}]")
+        st.write(f"Uploading for: **{store_data['store_code']}**")
 
-        # --- 3. THE UPLOAD FORM ---
-        col_input, col_cam = st.columns([1, 2])
+        c1, c2 = st.columns(2)
+        with c1: element = st.selectbox("Visual Element", ELEMENT_TYPES)
+        with c2: condition = st.selectbox("Condition", STATUS_OPTIONS)
         
-        with col_input:
-            element = st.selectbox("Visual Element", ELEMENT_TYPES)
-            condition = st.selectbox("Condition", STATUS_OPTIONS)
-            
-        with col_cam:
-            # KEY TRICK: We use st.session_state.uploader_key as the key.
-            # When we increment this number, Streamlit thinks it's a "new" widget and resets it.
-            photo = st.camera_input("Take Photo", key=f"cam_{st.session_state.uploader_key}")
+        photo = st.camera_input("Take Photo")
 
         if photo:
-            with st.spinner("Syncing to Server..."):
-                try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"{store_data['store_code']}/{element.replace(' ','')}_{timestamp}.jpg"
-                    file_bytes = photo.getvalue()
-                    
-                    # 1. Upload to Storage
-                    supabase.storage.from_("evidence-photos").upload(
-                        path=filename, 
-                        file=file_bytes, 
-                        file_options={"content-type": "image/jpeg"}
-                    )
-                    
-                    public_url = f"{st.secrets['supabase']['url']}/storage/v1/object/public/evidence-photos/{filename}"
-                    
-                    # 2. Log to Database
-                    data = {
-                        "store_code": store_data['store_code'],
-                        "element_type": element,
-                        "condition_status": condition,
-                        "image_url": public_url,
-                        "ai_status": "Pending",
-                        "campaign_name": "Pending Scan"
-                    }
-                    supabase.table("audit_logs").insert(data).execute()
-                    
-                    # 3. Success Logic
-                    st.success(f"✅ Uploaded: {element}")
-                    
-                    # Add to history list for display
-                    st.session_state.upload_history.insert(0, {
-                        "time": datetime.now().strftime("%H:%M"),
-                        "element": element,
-                        "status": "Uploaded"
-                    })
-                    
-                    # 4. RESET THE CAMERA (The Magic Step)
-                    st.session_state.uploader_key += 1
-                    time.sleep(1) # Small pause so user sees the success message
-                    st.rerun() # Forces app to reload with new empty camera
-                    
-                except Exception as e:
-                    st.error(f"Upload failed: {e}")
-
-        # --- 4. SESSION HISTORY (So they know what they finished) ---
-        if st.session_state.upload_history:
-            st.divider()
-            st.caption("Session Upload History (Cleared on refresh)")
-            # specific visual for history
-            for item in st.session_state.upload_history:
-                st.markdown(f"**{item['time']}** | {item['element']} ............ ✅ **Done**")
+            with st.spinner("Uploading to Central Server..."):
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"{store_data['store_code']}/{element.replace(' ','')}_{timestamp}.jpg"
+                file_bytes = photo.getvalue()
+                
+                # Upload
+                supabase.storage.from_("evidence-photos").upload(path=filename, file=file_bytes, file_options={"content-type": "image/jpeg"})
+                public_url = f"{st.secrets['supabase']['url']}/storage/v1/object/public/evidence-photos/{filename}"
+                
+                # Log to DB
+                data = {
+                    "store_code": store_data['store_code'],
+                    "element_type": element,
+                    "condition_status": condition,
+                    "image_url": public_url,
+                    "ai_status": "Pending",
+                    "campaign_name": "Pending Scan"
+                }
+                supabase.table("audit_logs").insert(data).execute()
+                st.success("✅ Uploaded Successfully!")
 
 def audit_dashboard(user_role, user_region=None):
     st.subheader("📊 Audit Dashboard")
