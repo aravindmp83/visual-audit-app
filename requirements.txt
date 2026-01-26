@@ -3,4 +3,4 @@ supabase
 opencv-python-headless
 numpy
 requests
-Pillow
+pandas
