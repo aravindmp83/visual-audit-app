@@ -47,13 +47,17 @@ def load_reference_memory():
                         arr = np.frombuffer(resp.content, np.uint8)
                         img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
                         
-                        # --- FIX: Resize Reference to match Evidence Scale ---
-                        if img is not None:
-                            h, w = img.shape
-                            if w > 800: 
-                                img = cv2.resize(img, (800, int(h*(800/w))))
-                            
-                            kp, des = orb.detectAndCompute(img, None)
+                        # ... inside the loop where you process 'img' ...
+
+# Resize Reference
+h, w = img.shape
+if w > 800: img = cv2.resize(img, (800, int(h*(800/w))))
+
+# APPLY LIGHTING FIX TO REFERENCE TOO
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+img = clahe.apply(img)
+
+kp, des = orb.detectAndCompute(img, None)
                             if des is not None:
                                 memory.append({"campaign": camp_name, "descriptors": des})
         return memory
