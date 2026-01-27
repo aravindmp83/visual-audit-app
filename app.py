@@ -19,7 +19,7 @@ def init_connections():
         su_key = st.secrets["supabase"]["key"]
         db = create_client(su_url, su_key)
         
-        # Google Gemini
+        # Google Gemini (Get Key: https://aistudio.google.com/)
         genai.configure(api_key=st.secrets["google"]["api_key"])
         
         return db
@@ -31,7 +31,7 @@ supabase: Client = init_connections()
 ELEMENT_TYPES = ["Totem Pole", "Backlit Board", "Flagpole/Lollypop", "Façade", "Select your signage", "Others"]
 STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
-# --- 2. AI ENGINE (POWERED BY GOOGLE GEMINI) ---
+# --- 2. AI ENGINE (OPTIMIZED BATCHING) ---
 def get_active_campaign_references():
     """Fetches reference images for campaigns active TODAY."""
     today = date.today().isoformat()
@@ -47,10 +47,10 @@ def get_active_campaign_references():
         files = supabase.storage.from_("references").list()
         for f in files:
             parts = f['name'].split('_')
+            # Check if file belongs to an active campaign
             if len(parts) > 0 and parts[0] in active_names:
-                # Get the Public URL
                 url = supabase.storage.from_("references").get_public_url(f['name'])
-                references.append({"campaign": parts[0], "url": url})
+                references.append({"name": parts[0], "url": url})
     except:
         pass
     return references
@@ -59,63 +59,63 @@ def run_gemini_audit(evidence_url, references):
     if not references: return 0, "Fail", "Unknown", "No Active Campaigns"
     
     try:
-        # 1. Load Evidence Image
+        # 1. Prepare Evidence Image
         resp_ev = requests.get(evidence_url)
         img_ev = Image.open(io.BytesIO(resp_ev.content))
 
-        # 2. Setup Gemini Model
+        # 2. Prepare Reference Images (Batch Download)
+        ref_images = []
+        ref_names = []
+        for ref in references:
+            try:
+                r = requests.get(ref['url'])
+                img = Image.open(io.BytesIO(r.content))
+                ref_images.append(img)
+                ref_names.append(ref['name'])
+            except: continue
+
+        if not ref_images: return 0, "Fail", "Unknown", "References failed to load"
+
+        # 3. Construct the "Batch" Prompt
+        # We send ALL references at once to save API quota
         model = genai.GenerativeModel('gemini-1.5-flash')
         
-        best_result = {"status": "Fail", "score": 0, "campaign": "Unknown", "reason": "No Match"}
-
-        # 3. Compare against each active reference
-        # (Optimized: We check them sequentially. In production, you might batch this)
-        for ref in references:
-            # Load Reference Image
-            resp_ref = requests.get(ref['url'])
-            img_ref = Image.open(io.BytesIO(resp_ref.content))
+        prompt = [
+            "Act as a Retail Audit AI.",
+            "I will provide you with ONE 'Store Photo' and a list of 'Reference Creatives'.",
+            "Your Task: Identify if the 'Store Photo' contains ANY of the 'Reference Creatives'.",
+            "Rules:",
+            "1. Analyze the 'Store Photo' (the last image provided).",
+            "2. Compare it against the Reference images provided earlier.",
+            "3. Ignore minor lighting/angle differences.",
+            "4. If a match is found, return the exact Name of the reference.",
+            "5. If NO match is found, return 'Fail'.",
+            "Output format: Status | ConfidenceScore | MatchedName | Reason",
+            "Example: Pass | 95 | WinterSale | Exact match found on totem pole.",
+            "Here are the Reference Creatives:",
+            *ref_images,  # Unpacks all reference images
+            f"Reference Names corresponding to images: {', '.join(ref_names)}",
+            "Here is the Store Photo:",
+            img_ev
+        ]
+        
+        # 4. Run AI
+        response = model.generate_content(prompt)
+        text = response.text.strip()
+        
+        # 5. Parse Response
+        # Expected: Pass | 90 | CampaignName | Reason
+        parts = text.split('|')
+        if len(parts) >= 3:
+            status = parts[0].strip()
+            score = int(parts[1].strip())
+            camp = parts[2].strip()
+            reason = parts[3].strip() if len(parts) > 3 else "AI Match"
             
-            # 4. The Magic Prompt
-            prompt = """
-            Act as a Retail Audit AI.
-            Image 1 is the OFFICIAL REFERENCE creative.
-            Image 2 is a STORE PHOTO taken by a manager.
-            
-            Task:
-            1. Look at the Reference.
-            2. Look at the Store Photo.
-            3. Is the Reference creative clearly visible in the Store Photo? (Ignore minor glare or angles).
-            4. If Yes, return "Pass". If No, return "Fail".
-            5. Give a confidence score (0-100).
-            
-            Output format: Status | Score
-            Example: Pass | 95
-            """
-            
-            response = model.generate_content([prompt, img_ref, img_ev])
-            text = response.text.strip()
-            
-            # Parse Response "Pass | 95"
-            try:
-                parts = text.split('|')
-                status = parts[0].strip()
-                score = int(parts[1].strip())
-                
-                if status == "Pass" and score > best_result['score']:
-                    best_result = {
-                        "status": "Pass", 
-                        "score": score, 
-                        "campaign": ref['campaign'], 
-                        "reason": "AI verified visual match"
-                    }
-            except:
-                continue
-
-        # 5. Return Best Match
-        if best_result['status'] == "Pass":
-            return best_result['score'], "Pass", best_result['campaign'], best_result['reason']
-        else:
-            return 0, "Fail", "Unknown", "Creative not found in photo"
+            if status.lower() == "pass":
+                return score, "Pass", camp, reason
+        
+        return 0, "Fail", "Unknown", "No match found in batch analysis"
 
     except Exception as e:
         return 0, "Fail", "Error", str(e)
@@ -271,6 +271,7 @@ def audit_dashboard(user_role, user_region=None):
             count = 0
             for log in logs:
                 if log['ai_status'] == "Pending":
+                    # Uses the BATCH function now
                     score, status, camp, reason = run_gemini_audit(log['image_url'], references)
                     
                     camp_stat = "Inactive"
