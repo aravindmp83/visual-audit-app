@@ -1,6 +1,6 @@
 import streamlit as st
 from supabase import create_client, Client
-from datetime import datetime
+from datetime import datetime, date
 import cv2
 import numpy as np
 import requests
@@ -17,20 +17,21 @@ def init_connection():
         key = st.secrets["supabase"]["key"]
         return create_client(url, key)
     except:
-        st.error("Supabase secrets missing. Check .streamlit/secrets.toml")
         return None
 
 supabase: Client = init_connection()
 
-# Updated Elements List
 ELEMENT_TYPES = ["Totem Pole", "Backlit Board", "Flagpole/Lollypop", "Façade", "Select your signage", "Others"]
 STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
-# --- 2. AI ENGINE ---
+# --- 2. AI ENGINE (DATE-AWARE) ---
 @st.cache_resource
 def load_reference_memory():
-    # Only load active campaigns
-    active_camps = supabase.table("campaigns").select("name").eq("is_active", True).execute().data
+    # 1. Fetch campaigns that are active TODAY
+    today = date.today().isoformat()
+    
+    # Logic: Start Date <= Today <= End Date
+    active_camps = supabase.table("campaigns").select("name").lte("start_date", today).gte("end_date", today).execute().data
     active_names = [c['name'] for c in active_camps]
     
     memory = []
@@ -42,6 +43,7 @@ def load_reference_memory():
                 parts = f['name'].split('_')
                 if len(parts) > 0:
                     camp_name = parts[0]
+                    # Only load if campaign is active TODAY
                     if camp_name in active_names:
                         url = supabase.storage.from_("references").get_public_url(f['name'])
                         resp = requests.get(url)
@@ -59,12 +61,12 @@ def load_reference_memory():
         return []
 
 def run_smart_audit(evidence_url, memory):
-    if not memory: return 0, "Fail", "Unknown", "No Active References"
+    if not memory: return 0, "Fail", "Unknown", "No Active Campaigns Found"
     try:
         resp = requests.get(evidence_url)
         arr = np.frombuffer(resp.content, np.uint8)
         img_ev = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-        # Resize for speed
+        
         h, w = img_ev.shape
         if w > 800: img_ev = cv2.resize(img_ev, (800, int(h*(800/w))))
         
@@ -91,44 +93,47 @@ def run_smart_audit(evidence_url, memory):
     except Exception as e:
         return 0, "Fail", "Error", str(e)
 
-# --- 3. STORE PORTAL (UPDATED) ---
+# --- 3. STORE PORTAL ---
 def store_login_view():
     st.markdown("### 🏪 Store Login")
-    # Requirement: Store Code input instead of dropdown
     store_code_input = st.text_input("Enter Store Code (Capital Letters)", max_chars=10).upper()
-    
-    if st.button("Login to Store"):
-        # Validate Store Code
+    if st.button("Login"):
         res = supabase.table("stores").select("*").eq("store_code", store_code_input).execute().data
         if res:
             st.session_state['store_user'] = res[0]
             st.rerun()
         else:
-            st.error("Invalid Store Code. Please check and try again.")
+            st.error("Invalid Store Code.")
 
 def store_upload_view():
     store = st.session_state['store_user']
-    st.markdown(f"### 👋 Welcome, {store['store_name']} ({store['store_code']})")
-    
+    st.markdown(f"### 👋 {store['store_name']} ({store['store_code']})")
     if st.button("🚪 Logout"):
         st.session_state['store_user'] = None
         st.rerun()
 
-    # Session State for upload flow
-    if 'temp_photo' not in st.session_state: st.session_state.temp_photo = None
-    
-    # Input Form
-    element = st.selectbox("Select Visual Element", ELEMENT_TYPES) #
+    element = st.selectbox("Visual Element", ELEMENT_TYPES)
     condition = st.selectbox("Condition", STATUS_OPTIONS)
 
-    # Big Camera / File Upload
-    st.write("Take a picture:")
-    # We use file_uploader because on mobile it offers "Take Photo" and uses the native full-screen camera
-    photo = st.file_uploader("Tap here to open Camera", type=['jpg','png','jpeg'])
+    # --- CAMERA INTERFACE FIX ---
+    st.write("---")
+    st.write("📸 **Capture Evidence**")
     
+    # Tabs allow user to choose based on their device
+    t1, t2 = st.tabs(["Live Camera", "File Upload"])
+    
+    photo = None
+    with t1:
+        # Full width camera input
+        cam = st.camera_input("Take Picture", key="live_cam")
+        if cam: photo = cam
+    with t2:
+        # File uploader for existing photos
+        up = st.file_uploader("Upload from Gallery", type=['jpg','png','jpeg'])
+        if up: photo = up
+
     if photo:
         st.image(photo, caption="Preview", width=300)
-        # Confirm Button
         if st.button("✅ Confirm & Upload"):
             with st.spinner("Uploading..."):
                 try:
@@ -136,9 +141,7 @@ def store_upload_view():
                     filename = f"{store['store_code']}/{element.replace(' ','')}_{timestamp}.jpg"
                     file_bytes = photo.getvalue()
                     
-                    supabase.storage.from_("evidence-photos").upload(
-                        path=filename, file=file_bytes, file_options={"content-type": "image/jpeg"}
-                    )
+                    supabase.storage.from_("evidence-photos").upload(filename, file_bytes, {"content-type": "image/jpeg"})
                     public_url = f"{st.secrets['supabase']['url']}/storage/v1/object/public/evidence-photos/{filename}"
                     
                     data = {
@@ -150,18 +153,13 @@ def store_upload_view():
                         "campaign_name": "Pending Scan"
                     }
                     supabase.table("audit_logs").insert(data).execute()
-                    
-                    st.success("Uploaded Successfully!")
-                    st.session_state.temp_photo = None
+                    st.success("Uploaded!")
                     time.sleep(1)
-                    
-                    # Loop Logic
-                    st.info("Do you have another marketing element in this store?")
-                    
+                    st.info("Do you have another element?")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-# --- 4. AUDIT DASHBOARD (UPDATED) ---
+# --- 4. AUDIT DASHBOARD ---
 def audit_dashboard(user_role, user_region=None):
     st.subheader("📊 Audit Dashboard")
     
@@ -169,7 +167,6 @@ def audit_dashboard(user_role, user_region=None):
     c1, c2, c3, c4 = st.columns(4)
     with c1: status_view = st.selectbox("Status", ["All", "Pending", "Pass", "Fail"])
     
-    # Store Filter Logic
     all_stores = supabase.table("stores").select("*").execute().data
     if user_role == 'RMM' and user_region:
         all_stores = [s for s in all_stores if s['region'] == user_region]
@@ -203,11 +200,16 @@ def audit_dashboard(user_role, user_region=None):
             for log in logs:
                 if log['ai_status'] == "Pending":
                     score, status, camp, reason = run_smart_audit(log['image_url'], memory)
-                    # Get Campaign Status
+                    
+                    # Check Date Validity for Status
                     camp_stat = "Inactive"
                     if status == "Pass":
-                        c_check = supabase.table("campaigns").select("is_active").eq("name", camp).execute().data
-                        if c_check and c_check[0]['is_active']: camp_stat = "Active"
+                        today = date.today().isoformat()
+                        c = supabase.table("campaigns").select("*").eq("name", camp).execute().data
+                        if c:
+                            # Check date range
+                            if c[0]['start_date'] <= today <= c[0]['end_date']:
+                                camp_stat = "Active"
                     
                     supabase.table("audit_logs").update({
                         "ai_score": score, "ai_status": status, 
@@ -219,26 +221,29 @@ def audit_dashboard(user_role, user_region=None):
             time.sleep(1)
             st.rerun()
 
-    # Reporting Cards
+    # Cards
     for log in logs:
         with st.container(border=True):
             col_img, col_info, col_act = st.columns([1, 2, 1])
             with col_img: st.image(log['image_url'], width=150)
             with col_info:
-                st.write(f"**{log['store_code']}** - {log['element_type']}") #
-                st.caption(f"Condition: {log['condition_status']}") #
+                st.write(f"**{log['store_code']}** - {log['element_type']}")
+                st.caption(f"Condition: {log['condition_status']}")
                 if log['ai_status'] != "Pending":
-                    st.caption(f"Campaign: {log.get('campaign_name')} ({log.get('campaign_status','Unknown')})") #
+                    st.caption(f"Campaign: {log.get('campaign_name')} ({log.get('campaign_status','Unknown')})")
             with col_act:
                 if log['ai_status'] == "Pending":
                     if st.button("Run Audit", key=log['id']):
                         memory = load_reference_memory()
                         score, status, camp, reason = run_smart_audit(log['image_url'], memory)
+                        
                         camp_stat = "Inactive"
                         if status == "Pass":
-                            c = supabase.table("campaigns").select("is_active").eq("name", camp).execute().data
-                            if c and c[0]['is_active']: camp_stat = "Active"
-                            
+                            today = date.today().isoformat()
+                            c = supabase.table("campaigns").select("*").eq("name", camp).execute().data
+                            if c and c[0]['start_date'] <= today <= c[0]['end_date']:
+                                camp_stat = "Active"
+
                         supabase.table("audit_logs").update({
                             "ai_score": score, "ai_status": status, 
                             "campaign_name": camp, "failure_reason": reason,
@@ -248,55 +253,62 @@ def audit_dashboard(user_role, user_region=None):
                 else:
                     color = "green" if log['ai_status'] == "Pass" else "red"
                     st.markdown(f":{color}[**{log['ai_status']}**]")
-                    if log['ai_status'] == "Fail": st.caption(log.get('failure_reason')) #
+                    if log['ai_status'] == "Fail": st.caption(log.get('failure_reason'))
 
-# --- 5. TRAIN AI (UPDATED) ---
+# --- 5. CAMPAIGN MANAGEMENT (DATE BASED) ---
 def train_ai_view():
     st.subheader("🎓 Campaign Management")
-    t1, t2 = st.tabs(["Campaigns", "Upload References"])
+    t1, t2 = st.tabs(["Manage Campaigns", "Upload References"])
     
-    with t1: #
+    with t1:
+        # Add Campaign with Dates
         with st.form("new_camp"):
-            name = st.text_input("Campaign Name")
-            active = st.checkbox("Active", value=True)
-            if st.form_submit_button("Add"):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("Campaign Name")
+            s_date = c2.date_input("Start Date")
+            e_date = c3.date_input("End Date")
+            
+            if st.form_submit_button("Add Campaign"):
                 try:
-                    supabase.table("campaigns").insert({"name":name, "is_active":active}).execute()
+                    supabase.table("campaigns").insert({
+                        "name":name, 
+                        "start_date": s_date.isoformat(), 
+                        "end_date": e_date.isoformat()
+                    }).execute()
                     st.success("Added")
                     st.rerun()
-                except: st.error("Duplicate name")
+                except: st.error("Error/Duplicate")
         
+        # Display Table with Status Calculation
         camps = supabase.table("campaigns").select("*").execute().data
-        for c in camps:
-            c1, c2, c3 = st.columns([1,3,1])
-            c1.write(c['id'])
-            c2.write(c['name'])
-            if c3.checkbox("Active", value=c['is_active'], key=c['id']):
-                if not c['is_active']: 
-                    supabase.table("campaigns").update({"is_active": True}).eq("id", c['id']).execute()
-                    st.rerun()
-            else:
-                if c['is_active']:
-                    supabase.table("campaigns").update({"is_active": False}).eq("id", c['id']).execute()
-                    st.rerun()
+        if camps:
+            data_for_table = []
+            today = date.today().isoformat()
+            for c in camps:
+                status = "Active" if c['start_date'] <= today <= c['end_date'] else "Inactive"
+                data_for_table.append({
+                    "Name": c['name'],
+                    "Start": c['start_date'],
+                    "End": c['end_date'],
+                    "Status": status
+                })
+            st.dataframe(data_for_table, use_container_width=True)
 
-    with t2: #
-        active_camps = [c['name'] for c in camps if c['is_active']]
-        sel_camp = st.selectbox("Select Campaign", active_camps)
+    with t2:
+        # Only show campaigns that are currently Active or Upcoming
+        camp_names = [c['name'] for c in camps]
+        sel_camp = st.selectbox("Select Campaign", camp_names)
         
-        # Prevent Duplicate Uploads by clearing widget
         uploaded = st.file_uploader("Upload JPEGs", accept_multiple_files=True)
         if st.button("Upload Reference"):
             if uploaded:
                 for f in uploaded:
-                    # Basic duplicate check by name
                     safe_name = f.name.replace(" ", "_")
-                    fname = f"{sel_camp}_{safe_name}" # Simplified name to check dupe
+                    fname = f"{sel_camp}_{safe_name}"
                     try:
                         fb = f.getvalue()
                         supabase.storage.from_("references").upload(fname, fb, {"content-type": "image/jpeg"})
-                    except:
-                        st.warning(f"Skipped {f.name} (Duplicate)")
+                    except: pass
                 st.success("Completed")
                 st.cache_resource.clear()
                 time.sleep(1)
@@ -304,7 +316,7 @@ def train_ai_view():
 
 # --- 6. AUTH & MAIN ---
 def login_page(role):
-    st.markdown(f"### {role} Login") #
+    st.markdown(f"### {role} Login")
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
     
@@ -318,7 +330,7 @@ def login_page(role):
             else: st.warning("Pending Approval")
         else: st.error("Invalid Credentials")
 
-    if role == "RMM": #
+    if role == "RMM":
         with st.expander("New RMM? Sign Up"):
             nu = st.text_input("New Username")
             np = st.text_input("New Password", type="password")
@@ -335,7 +347,6 @@ def main():
     if 'store_user' not in st.session_state: st.session_state['store_user'] = None
     if 'user' not in st.session_state: st.session_state['user'] = None
 
-    # Logic: Store Portal OR Admin/RMM Portal
     if st.session_state['store_user']:
         store_upload_view()
     elif st.session_state['user']:
@@ -349,7 +360,7 @@ def main():
         with t1: audit_dashboard(user['role'], user.get('region'))
         with t2: train_ai_view()
         with t3:
-            if user['role'] == "HQ": #
+            if user['role'] == "HQ":
                 st.write("Approve RMMs")
                 pending = supabase.table("users").select("*").eq("is_approved", False).execute().data
                 for p in pending:
@@ -361,8 +372,7 @@ def main():
             else: st.info("Restricted")
 
     else:
-        # Landing Page
-        choice = st.selectbox("Select Portal", ["Store Login", "RMM Login", "Admin Login"]) #
+        choice = st.selectbox("Select Portal", ["Store Login", "RMM Login", "Admin Login"])
         if choice == "Store Login": store_login_view()
         elif choice == "RMM Login": login_page("RMM")
         elif choice == "Admin Login": login_page("Admin")
