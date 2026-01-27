@@ -61,37 +61,60 @@ def load_reference_memory():
         return []
 
 def run_smart_audit(evidence_url, memory):
-    if not memory: return 0, "Fail", "Unknown", "No Active Campaigns"
+    if not memory: return 0, "Fail", "Unknown", "No Active Campaigns Found"
     try:
+        # 1. Download & Decode Evidence
         resp = requests.get(evidence_url)
         arr = np.frombuffer(resp.content, np.uint8)
         img_ev = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
         
-        # Resize Evidence
+        # 2. Resize for Consistency (Match Reference Scale)
         h, w = img_ev.shape
         if w > 800: img_ev = cv2.resize(img_ev, (800, int(h*(800/w))))
         
-        orb = cv2.ORB_create(nfeatures=1000)
+        # 3. APPLY LIGHTING CORRECTION (CLAHE)
+        # This fixes glare and shadows
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        img_ev = clahe.apply(img_ev)
+        
+        # 4. Detect Features
+        orb = cv2.ORB_create(nfeatures=2000) # Increased features for better accuracy
         kp_ev, des_ev = orb.detectAndCompute(img_ev, None)
+        
         if des_ev is None: return 0, "Fail", "Unknown", "Blurry/No Features"
         
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        # 5. Advanced Matching (KNN + Lowe's Ratio Test)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING) # Removed crossCheck=True for KNN
         best_score = 0
         best_campaign = "Unknown"
         
         for ref in memory:
-            matches = bf.match(des_ev, ref['descriptors'])
-            matches = sorted(matches, key=lambda x: x.distance)
-            score = len([m for m in matches if m.distance < 50])
-            if score > best_score:
-                best_score = score
-                best_campaign = ref['campaign']
+            # We assume reference descriptors are already computed/loaded
+            try:
+                matches = bf.knnMatch(des_ev, ref['descriptors'], k=2)
+                
+                # Apply Lowe's Ratio Test
+                # This keeps only "High Quality" matches
+                good_matches = []
+                for m, n in matches:
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+                
+                score = len(good_matches)
+                
+                if score > best_score:
+                    best_score = score
+                    best_campaign = ref['campaign']
+            except:
+                continue
         
-        # Threshold: 12 matches (slightly lowered for robustness)
-        if best_score > 12: 
-            return best_score, "Pass", best_campaign, "Matched Reference"
+        # 6. Dynamic Thresholding
+        # If we found > 10 High Quality matches, it's a Pass
+        if best_score > 10: 
+            return best_score, "Pass", best_campaign, "Matched Reference Pattern"
         else: 
-            return best_score, "Fail", "Unknown", f"Low Match ({best_score})"
+            return best_score, "Fail", "Unknown", f"Low Confidence ({best_score} matches)"
+
     except Exception as e:
         return 0, "Fail", "Error", str(e)
 
