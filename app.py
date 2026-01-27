@@ -1,125 +1,121 @@
 import streamlit as st
 from supabase import create_client, Client
 from datetime import datetime, date
-import cv2
-import numpy as np
+import google.generativeai as genai
 import requests
 import time
 import pandas as pd
+from PIL import Image
+import io
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Retail Visual Audit", page_icon="🏢", layout="wide")
 
 @st.cache_resource
-def init_connection():
+def init_connections():
     try:
-        url = st.secrets["supabase"]["url"]
-        key = st.secrets["supabase"]["key"]
-        return create_client(url, key)
+        # Supabase
+        su_url = st.secrets["supabase"]["url"]
+        su_key = st.secrets["supabase"]["key"]
+        db = create_client(su_url, su_key)
+        
+        # Google Gemini
+        genai.configure(api_key=st.secrets["google"]["api_key"])
+        
+        return db
     except:
         return None
 
-supabase: Client = init_connection()
+supabase: Client = init_connections()
 
 ELEMENT_TYPES = ["Totem Pole", "Backlit Board", "Flagpole/Lollypop", "Façade", "Select your signage", "Others"]
 STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
-# --- 2. AI ENGINE ---
-@st.cache_resource
-def load_reference_memory():
-    # Fetch active campaigns based on date
+# --- 2. AI ENGINE (POWERED BY GOOGLE GEMINI) ---
+def get_active_campaign_references():
+    """Fetches reference images for campaigns active TODAY."""
     today = date.today().isoformat()
-    # Logic: Start Date <= Today <= End Date
+    # 1. Get Active Campaigns
     active_camps = supabase.table("campaigns").select("name").lte("start_date", today).gte("end_date", today).execute().data
     active_names = [c['name'] for c in active_camps]
     
-    memory = []
-    # Increased sensitivity (2000 features)
-    orb = cv2.ORB_create(nfeatures=2000)
-    
+    if not active_names: return []
+
+    # 2. Find matching files in storage
+    references = []
     try:
         files = supabase.storage.from_("references").list()
         for f in files:
-            if f['name'].lower().endswith(('.jpg', '.jpeg', '.png')):
-                parts = f['name'].split('_')
-                if len(parts) > 0:
-                    camp_name = parts[0]
-                    # Only load if campaign is active TODAY
-                    if camp_name in active_names:
-                        url = supabase.storage.from_("references").get_public_url(f['name'])
-                        resp = requests.get(url)
-                        arr = np.frombuffer(resp.content, np.uint8)
-                        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
-                        
-                        if img is not None:
-                            # 1. RESIZE REFERENCE (Crucial for consistency)
-                            h, w = img.shape
-                            if w > 800: img = cv2.resize(img, (800, int(h*(800/w))))
-                            
-                            # 2. LIGHTING CORRECTION (CLAHE)
-                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-                            img = clahe.apply(img)
-                            
-                            kp, des = orb.detectAndCompute(img, None)
-                            if des is not None:
-                                memory.append({"campaign": camp_name, "descriptors": des})
-        return memory
-    except Exception as e:
-        print(f"Memory Error: {e}")
-        return []
+            parts = f['name'].split('_')
+            if len(parts) > 0 and parts[0] in active_names:
+                # Get the Public URL
+                url = supabase.storage.from_("references").get_public_url(f['name'])
+                references.append({"campaign": parts[0], "url": url})
+    except:
+        pass
+    return references
 
-def run_smart_audit(evidence_url, memory):
-    if not memory: return 0, "Fail", "Unknown", "No Active Campaigns"
+def run_gemini_audit(evidence_url, references):
+    if not references: return 0, "Fail", "Unknown", "No Active Campaigns"
+    
     try:
-        # Download Evidence
-        resp = requests.get(evidence_url)
-        arr = np.frombuffer(resp.content, np.uint8)
-        img_ev = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        # 1. Load Evidence Image
+        resp_ev = requests.get(evidence_url)
+        img_ev = Image.open(io.BytesIO(resp_ev.content))
+
+        # 2. Setup Gemini Model
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # 1. RESIZE EVIDENCE (Must match reference scale)
-        h, w = img_ev.shape
-        if w > 800: img_ev = cv2.resize(img_ev, (800, int(h*(800/w))))
-        
-        # 2. LIGHTING CORRECTION (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        img_ev = clahe.apply(img_ev)
-        
-        # Detect Features
-        orb = cv2.ORB_create(nfeatures=2000)
-        kp_ev, des_ev = orb.detectAndCompute(img_ev, None)
-        
-        if des_ev is None: return 0, "Fail", "Unknown", "Blurry/No Features"
-        
-        # 3. ROBUST MATCHING (KNN + Lowe's Ratio Test)
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING) 
-        best_score = 0
-        best_campaign = "Unknown"
-        
-        for ref in memory:
+        best_result = {"status": "Fail", "score": 0, "campaign": "Unknown", "reason": "No Match"}
+
+        # 3. Compare against each active reference
+        # (Optimized: We check them sequentially. In production, you might batch this)
+        for ref in references:
+            # Load Reference Image
+            resp_ref = requests.get(ref['url'])
+            img_ref = Image.open(io.BytesIO(resp_ref.content))
+            
+            # 4. The Magic Prompt
+            prompt = """
+            Act as a Retail Audit AI.
+            Image 1 is the OFFICIAL REFERENCE creative.
+            Image 2 is a STORE PHOTO taken by a manager.
+            
+            Task:
+            1. Look at the Reference.
+            2. Look at the Store Photo.
+            3. Is the Reference creative clearly visible in the Store Photo? (Ignore minor glare or angles).
+            4. If Yes, return "Pass". If No, return "Fail".
+            5. Give a confidence score (0-100).
+            
+            Output format: Status | Score
+            Example: Pass | 95
+            """
+            
+            response = model.generate_content([prompt, img_ref, img_ev])
+            text = response.text.strip()
+            
+            # Parse Response "Pass | 95"
             try:
-                # Find top 2 matches for each point
-                matches = bf.knnMatch(des_ev, ref['descriptors'], k=2)
+                parts = text.split('|')
+                status = parts[0].strip()
+                score = int(parts[1].strip())
                 
-                # Apply Ratio Test (filters out 90% of false positives)
-                good_matches = []
-                for m, n in matches:
-                    if m.distance < 0.75 * n.distance:
-                        good_matches.append(m)
-                
-                score = len(good_matches)
-                
-                if score > best_score:
-                    best_score = score
-                    best_campaign = ref['campaign']
+                if status == "Pass" and score > best_result['score']:
+                    best_result = {
+                        "status": "Pass", 
+                        "score": score, 
+                        "campaign": ref['campaign'], 
+                        "reason": "AI verified visual match"
+                    }
             except:
                 continue
-        
-        # 4. FINAL DECISION
-        # If we have >10 solid, geometrically verified matches, it's a pass
-        if best_score > 10: 
-            return best_score, "Pass", best_campaign, "Matched Reference Pattern"
-        else: 
-            return best_score, "Fail", "Unknown", f"Low Match ({best_score})"
+
+        # 5. Return Best Match
+        if best_result['status'] == "Pass":
+            return best_result['score'], "Pass", best_result['campaign'], best_result['reason']
+        else:
+            return 0, "Fail", "Unknown", "Creative not found in photo"
 
     except Exception as e:
         return 0, "Fail", "Error", str(e)
@@ -153,14 +149,13 @@ def store_upload_view():
     if st.session_state.upload_stage == "capture":
         st.info("Step 1: Take or Upload a Picture")
         
-        t1, t2 = st.tabs(["Live Camera", "File Upload"])
+        t1, t2 = st.tabs(["📷 Live Camera", "📂 File Upload"])
         photo = None
         
         with t1:
             cam = st.camera_input("Take Picture", key=f"cam_{st.session_state.get('uploader_key', 0)}")
             if cam: photo = cam
         with t2:
-            # File uploader allows native camera on mobile
             up = st.file_uploader("Upload Image", type=['jpg','png','jpeg'], key=f"up_{st.session_state.get('uploader_key', 0)}")
             if up: photo = up
 
@@ -238,7 +233,7 @@ def store_upload_view():
 
 # --- 4. AUDIT DASHBOARD ---
 def audit_dashboard(user_role, user_region=None):
-    st.subheader("📊 Audit Dashboard")
+    st.subheader("📊 Audit Dashboard (Gemini AI)")
     
     # Filters
     c1, c2, c3, c4 = st.columns(4)
@@ -270,13 +265,13 @@ def audit_dashboard(user_role, user_region=None):
     logs = query.execute().data
 
     # Bulk Audit
-    if st.button("🚀 Run Bulk Audit"):
-        with st.status("Auditing..."):
-            memory = load_reference_memory()
+    if st.button("🚀 Run Gemini Audit"):
+        with st.status("Thinking... (Powered by Google Gemini)"):
+            references = get_active_campaign_references()
             count = 0
             for log in logs:
                 if log['ai_status'] == "Pending":
-                    score, status, camp, reason = run_smart_audit(log['image_url'], memory)
+                    score, status, camp, reason = run_gemini_audit(log['image_url'], references)
                     
                     camp_stat = "Inactive"
                     if status == "Pass":
@@ -307,8 +302,8 @@ def audit_dashboard(user_role, user_region=None):
             with col_act:
                 if log['ai_status'] == "Pending":
                     if st.button("Run Audit", key=log['id']):
-                        memory = load_reference_memory()
-                        score, status, camp, reason = run_smart_audit(log['image_url'], memory)
+                        references = get_active_campaign_references()
+                        score, status, camp, reason = run_gemini_audit(log['image_url'], references)
                         
                         camp_stat = "Inactive"
                         if status == "Pass":
@@ -366,7 +361,6 @@ def train_ai_view():
                         supabase.storage.from_("references").upload(fname, fb, {"content-type": "image/jpeg"})
                     except: pass
                 st.success("Completed")
-                st.cache_resource.clear()
                 time.sleep(1)
                 st.rerun()
 
