@@ -19,7 +19,7 @@ def init_connections():
         su_key = st.secrets["supabase"]["key"]
         db = create_client(su_url, su_key)
         
-        # Google Gemini (Get Key: https://aistudio.google.com/)
+        # Google Gemini
         genai.configure(api_key=st.secrets["google"]["api_key"])
         
         return db
@@ -31,7 +31,7 @@ supabase: Client = init_connections()
 ELEMENT_TYPES = ["Totem Pole", "Backlit Board", "Flagpole/Lollypop", "Façade", "Select your signage", "Others"]
 STATUS_OPTIONS = ["Intact", "Flex Damage", "Frame Damage", "Total Damage", "Letter Damage"]
 
-# --- 2. AI ENGINE (OPTIMIZED BATCHING) ---
+# --- 2. AI ENGINE (GEMINI BATCH) ---
 def get_active_campaign_references():
     """Fetches reference images for campaigns active TODAY."""
     today = date.today().isoformat()
@@ -77,7 +77,6 @@ def run_gemini_audit(evidence_url, references):
         if not ref_images: return 0, "Fail", "Unknown", "References failed to load"
 
         # 3. Construct the "Batch" Prompt
-        # We send ALL references at once to save API quota
         model = genai.GenerativeModel('gemini-1.5-flash')
         
         prompt = [
@@ -93,8 +92,8 @@ def run_gemini_audit(evidence_url, references):
             "Output format: Status | ConfidenceScore | MatchedName | Reason",
             "Example: Pass | 95 | WinterSale | Exact match found on totem pole.",
             "Here are the Reference Creatives:",
-            *ref_images,  # Unpacks all reference images
-            f"Reference Names corresponding to images: {', '.join(ref_names)}",
+            *ref_images,
+            f"Reference Names: {', '.join(ref_names)}",
             "Here is the Store Photo:",
             img_ev
         ]
@@ -104,7 +103,6 @@ def run_gemini_audit(evidence_url, references):
         text = response.text.strip()
         
         # 5. Parse Response
-        # Expected: Pass | 90 | CampaignName | Reason
         parts = text.split('|')
         if len(parts) >= 3:
             status = parts[0].strip()
@@ -271,7 +269,6 @@ def audit_dashboard(user_role, user_region=None):
             count = 0
             for log in logs:
                 if log['ai_status'] == "Pending":
-                    # Uses the BATCH function now
                     score, status, camp, reason = run_gemini_audit(log['image_url'], references)
                     
                     camp_stat = "Inactive"
